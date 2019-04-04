@@ -1,0 +1,307 @@
+# 在Kubernetes Ingress中使用Cert-Manager管理TLS证书
+
+Kubernetes Ingresses 允许你灵活的将外部流量路由到集群内部。我们通过Ingress资源定义规则路由HTTP和HTTPS流量到Kubernetes Services。本文中我们通过cert-manager来管理TLS证书以加密HTTP流量。
+
+## 部署后端服务
+
+首先我们需要一个事例服务，部署配置文件(echo.yaml)如下：
+
+    apiVersion: v1
+    kind: Service
+    metadata:
+    name: echo
+    spec:
+    ports:
+    - port: 80
+        targetPort: 5678
+    selector:
+        app: echo
+    ---
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata:
+    name: echo
+    spec:
+    selector:
+        matchLabels:
+        app: echo
+    replicas: 2
+    template:
+        metadata:
+        labels:
+            app: echo
+        spec:
+        containers:
+        - name: echo1
+            image: hashicorp/http-echo
+            args:
+            - "-text=echo"
+            ports:
+            - containerPort: 5678
+
+在这个配置文件中我们定义了一个服务叫做`echo`，它会将来自于80端口的TCP流量路由到标签为`app: echo`的Pods中的5678端口上。 
+我们定义了名为`echo`的Deployment，它用来管理打了`app: echo`标签的Pods。我们在Deployment中定义Pod的副本数为2，Pod启动的容器名为`echo`，使用的镜像为`hashicorp/http-echo`，我们给`echo`传递了`text`参数，值为`echo`，意思是我们在访问这个服务时，他向我们返回`echo`字符串。最后，我们打开了5678端口来监听用户请求。
+
+现在，我们通过kubectl create将其部署到集群中
+
+    $ kubectl create -f echo.yaml
+
+确认部署的服务已经启动
+
+    $ kubectl get svc echo
+    NAME      TYPE        CLUSTER-IP       EXTERNAL-IP   PORT(S)   AGE
+    echo      ClusterIP   10.245.222.129   <none>        80/TCP    60s
+
+在集群内部`echo`服务已经可以通过10.245.222.129的80端口进行访问，通过CLUSTER-IP访问流量会被路由到后端Pod的5678端口上。
+
+## 部署Nginx Ingress控制器
+
+在Kubernetes中，比较常用的Ingress控制器有Nginx、Contour、HaProxy、Traefik等。在此我们通过helm部署Nginx Ingress。
+
+我们通过执行kubectl apply来部署Nginx Ingress
+
+    $ kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/master/deploy/mandatory.yaml
+    namespace/ingress-nginx created
+    configmap/nginx-configuration created
+    configmap/tcp-services created
+    configmap/udp-services created
+    serviceaccount/nginx-ingress-serviceaccount created
+    clusterrole.rbac.authorization.k8s.io/nginx-ingress-clusterrole created
+    role.rbac.authorization.k8s.io/nginx-ingress-role created
+    rolebinding.rbac.authorization.k8s.io/nginx-ingress-role-nisa-binding created
+    clusterrolebinding.rbac.authorization.k8s.io/nginx-ingress-clusterrole-nisa-binding created
+    deployment.extensions/nginx-ingress-controller created
+
+如果你使用的是阿里云，可以创建一个4层SLB为Nginx Ingress做负载均衡。
+
+在你Kubernetes所在区，点击`创建负载均衡`
+
+![创建负载均衡](https://github.com/findsec-cn/k201/raw/master/imgs/1/ali_slb_create.jpg)
+
+选择可用区，填写实例名，现在实例规则，然后点`击立即购买`
+
+![配置负载均衡参数](https://github.com/findsec-cn/k201/raw/master/imgs/1/ali_slb_create2.jpg)
+
+跳转到`负载均衡控制台`，点击`点我开始配置`
+
+![配置负载均衡参数](https://github.com/findsec-cn/k201/raw/master/imgs/1/ali_slb_setting.jpg)
+
+选择监听协议TCP，监听端口80
+
+![配置负载均衡监听端口80](https://github.com/findsec-cn/k201/raw/master/imgs/1/ali_slb_setting_tcp_80.jpg)
+
+点击`下一步`创建虚拟服务器组，后端服务添加Nginx Ingress所在的节点，端口为80端口，然后配置健康检查就可以了
+
+![创建虚拟服务器组](https://github.com/findsec-cn/k201/raw/master/imgs/1/ali_slb_setting_vsg_80.jpg)
+
+同样添加对TCP443端口的监听
+
+![配置负载均衡监听端口443](https://github.com/findsec-cn/k201/raw/master/imgs/1/ali_slb_setting_tcp_443.jpg)
+
+点击`下一步`创建虚拟服务器组，后端服务添加Nginx Ingress所在的节点，端口为443端口，然后配置健康检查就可以了
+
+![创建虚拟服务器组](https://github.com/findsec-cn/k201/raw/master/imgs/1/ali_slb_setting_vsg_443.jpg)
+
+到此，负载均衡就配置完成了。
+
+## 创建Ingress资源
+
+现在就可以创建Ingress资源，如下编写配置文件（echo_ingress.yaml）：
+
+    apiVersion: extensions/v1beta1
+    kind: Ingress
+    metadata:
+    name: echo-ingress
+    spec:
+    rules:
+    - host: echo.example.com
+        http:
+        paths:
+        - backend:
+            serviceName: echo
+            servicePort: 80
+
+当用户通过echo.example.com访问Ingress时，访问流量会被路由到echo这个服务的80端口上。
+
+我们需要经echo.example.com这个域名解析到我们上面配置4层负载均衡的外网地址上。后面通过Cert-Manager申请TLS证书时会验证对这个域名的控制权。
+
+通过curl访问域名会返回echo字符串说明配置无误
+
+    $ curl echo1.example.com
+    echo
+
+## 安装并配置Cert-Manager
+
+在通过helm安装Cert-Manager前需要先创建好CRD资源
+
+    $ kubectl apply \
+        -f https://raw.githubusercontent.com/jetstack/cert-manager/release-0.6/deploy/manifests/00-crds.yaml
+    customresourcedefinition.apiextensions.k8s.io/certificates.certmanager.k8s.io created
+    customresourcedefinition.apiextensions.k8s.io/issuers.certmanager.k8s.io created
+    customresourcedefinition.apiextensions.k8s.io/clusterissuers.certmanager.k8s.io created
+    customresourcedefinition.apiextensions.k8s.io/orders.certmanager.k8s.io created
+    customresourcedefinition.apiextensions.k8s.io/challenges.certmanager.k8s.io created
+
+为安装的namespace kube-system添加标签
+
+    $ kubectl label namespace kube-system certmanager.k8s.io/disable-validation="true"
+
+然后，通过helm部署
+
+    $ helm install --name cert-manager --namespace kube-system stable/cert-manager
+    NOTES:
+    cert-manager has been deployed successfully!
+
+    In order to begin issuing certificates, you will need to set up a ClusterIssuer
+    or Issuer resource (for example, by creating a 'letsencrypt-staging' issuer).
+
+    More information on the different types of issuers and how to configure them
+    can be found in our documentation:
+
+    https://cert-manager.readthedocs.io/en/latest/reference/issuers.html
+
+    For information on how to configure cert-manager to automatically provision
+    Certificates for Ingress resources, take a look at the `ingress-shim`
+    documentation:
+
+    https://cert-manager.readthedocs.io/en/latest/reference/ingress-shim.html
+
+创建预发环境 Cluster Issuer（letsencrypt-clusterissuer-staging.yaml）
+
+    apiVersion: certmanager.k8s.io/v1alpha1
+    kind: ClusterIssuer
+    metadata:
+    name: letsencrypt-staging
+    spec:
+    acme:
+        # The ACME server URL
+        server: https://acme-staging-v02.api.letsencrypt.org/directory
+        # Email address used for ACME registration
+        email: <admin@gmail.com>
+        # Name of a secret used to store the ACME account private key
+        privateKeySecretRef:
+        name: letsencrypt-staging
+        # Enable the HTTP-01 challenge provider
+        http01: {}
+
+这是一个预备环境的集群级别的Issuer，需要用这个接口把流程走通。Cert-Manager通过这个Issuer去letsencrypt申请证书，在这个Issuer定义了letsencrypt证书申请地址，letsencrypt通过HTTP访问约定好的一个地址来进行域名鉴权。
+
+创建Issuer
+
+    $ kubectl create -f letsencrypt-clusterissuer-staging.yaml
+    clusterissuer.certmanager.k8s.io/letsencrypt-staging created
+
+修改echo_ingress.yaml使用新创建的Issuer
+
+    apiVersion: extensions/v1beta1
+    kind: Ingress
+    metadata:
+    name: echo-ingress
+    annotations:  
+        kubernetes.io/ingress.class: nginx
+        certmanager.k8s.io/cluster-issuer: letsencrypt-staging
+    spec:
+    tls:
+    - hosts:
+        - echo.example.com
+        secretName: letsencrypt-staging
+    rules:
+    - host: echo.example.com
+        http:
+        paths:
+        - backend:
+            serviceName: echo
+            servicePort: 80
+
+添加annotations，使用nginx ingress，并且使用letsencrypt-staging这个Issuer去申请证书，证书存储在`secretName: letsencrypt-staging`
+
+使用`kubectl describe`查看证书详情
+
+    $ kubectl describe ingress
+    Events:
+      Type    Reason             Age               From                      Message
+      ----    ------             ----              ----                      -------
+      Normal  CREATE             14m               nginx-ingress-controller  Ingress default/echo-ingress
+      Normal  UPDATE             1m (x2 over 13m)  nginx-ingress-controller  Ingress default/echo-ingress
+      Normal  CreateCertificate  1m                cert-manager              Successfully created Certificate "letsencrypt-staging"
+
+发现证书已经申请成功
+
+    $ wget --save-headers -O- https://echo.example.com
+    URL transformed to HTTPS due to an HSTS policy
+    --2018-12-11 14:38:24--  https://echo.example.com/
+    Resolving echo.example.com (echo.example.com)... 203.0.113.0
+    Connecting to echo.example.com (echo.example.com)|203.0.113.0|:443... connected.
+    ERROR: cannot verify echo.example.com's certificate, issued by ‘CN=Fake LE Intermediate X1’:
+    Unable to locally verify the issuer's authority.
+    To connect to echo.example.com insecurely, use `--no-check-certificate'.
+
+HTTPS协议已经可以访问，但是证书是ERROR状态的，我们需要申请生成环境的证书
+
+创建生产环境 Cluster Issuer（letsencrypt-clusterissuer-prod.yaml）
+
+    apiVersion: certmanager.k8s.io/v1alpha1
+    kind: ClusterIssuer
+    metadata:
+    name: letsencrypt-prod
+    spec:
+    acme:
+        # The ACME server URL
+        server: https://acme-v02.api.letsencrypt.org/directory
+        # Email address used for ACME registration
+        email: <admin@gmail.com>
+        # Name of a secret used to store the ACME account private key
+        privateKeySecretRef:
+        name: letsencrypt-prod
+        # Enable the HTTP-01 challenge provider
+        http01: {}
+
+创建Issuer
+
+    $ kubectl create -f letsencrypt-clusterissuer-prod.yaml
+    clusterissuer.certmanager.k8s.io/letsencrypt-prod created
+
+编辑echo_ingress.yaml使用新创建的Issuer
+
+    apiVersion: extensions/v1beta1
+    kind: Ingress
+    metadata:
+    name: echo-ingress
+    annotations:  
+        kubernetes.io/ingress.class: nginx
+        certmanager.k8s.io/cluster-issuer: letsencrypt-prod
+    spec:
+    tls:
+    - hosts:
+        - echo.example.com
+        secretName: letsencrypt-prod
+    rules:
+    - host: echo.example.com
+        http:
+        paths:
+        - backend:
+            serviceName: echo
+            servicePort: 80
+
+执行命令是更改生效
+
+    $ kubectl apply -f echo_ingress.yaml
+
+查看证书申请详情：
+
+    $ kubectl describe certificate letsencrypt-prod
+      Events:
+      Type    Reason         Age    From          Message
+      ----    ------         ----   ----          -------
+      Normal  Generated      2m53s  cert-manager  Generated new private key
+      Normal  OrderCreated   2m53s  cert-manager  Created Order resource "letsencrypt-prod-3570505900"
+      Normal  OrderComplete  77s    cert-manager  Order "letsencrypt-prod-3570505900" completed successfully
+      Normal  CertIssued     77s    cert-manager  Certificate issued successfully
+
+发现证书已经申请成功
+
+我们可以通过 kubectl describe order 查看证书订单，通过kubectl describe challenge查看证书验证通道，证书默认是有有效期的，在证书失效以前Cert-Manager会帮我申请新证书。
+
+在浏览器中访问https://echo.example.com，可以查看到域名的证书。
+
+![域名证书](https://github.com/findsec-cn/k201/raw/master/imgs/1/tls.jpg)
