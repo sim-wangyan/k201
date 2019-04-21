@@ -8,10 +8,10 @@ kubernetesVersion: v1.14.1
 apiServer:
     certSANs:
     - "apiserver.hipstershop.com"
-    - "172.16.1.10"
-    - "172.16.10.10"
-    - "172.16.10.11"
-    - "172.16.10.12"
+    - "172.16.1.50"
+    - "172.16.10.48"
+    - "172.16.10.49"
+    - "172.16.10.50"
     extraArgs:
         allow-privileged: "true"
         feature-gates: "VolumeSnapshotDataSource=true,CSINodeInfo=true,CSIDriverRegistry=true"
